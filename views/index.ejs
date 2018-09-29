@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<head>   
+    <title>O' Reilly Introduction to WebRtc</title>
+    <link rel="stylesheet" type="text/css" href="styles.css">
+            <html lang="eng">
+    <script src="/socket.io/socket.io.js" ></script>
+</head>
+<body>
+
+    <video id="myVideoTag" autoplay></video>
+    <video id="theirVideoTag" autoplay></video>
+    <div>
+        <input type="file" id="sendFile"/><br/>
+        <progress id="fileProgress" value="1" max="100"></progress>
+        <a id="receivedFileLink"></a>
+        <hr/>
+    </div>
+    <div>
+        <label>Your name</label><input  id="myName" type="text"/>
+        <label>Message</label><input id="myMessage" type="text" />
+        <input  id="sendMessage" type="submit"/>
+        <div id="chatArea">Message Output:<br></div>
+        <div id="signalingArea">Signaling Messages:<br/></div>
+    </div>
+    <script>         
+        var myVideoArea = document.querySelector("#myVideoTag");
+        var theirVideoArea = document.querySelector("#theirVideoTag");
+        //var videoSelect = document.querySelector("#camera") //teniendo una referencia del videoselector
+        var myName = document.querySelector('#myName')
+        var myMessage = document.querySelector('#myMessage')
+        var sendMessage = document.querySelector('#sendMessage')
+        var chatArea = document.querySelector('#chatArea')
+        var signalingArea = document.querySelector("#signalingArea")
+        var sendFile = document.querySelector("input#sendFile")
+        var fileProgress = document.querySelector("progress#fileProgress")
+        var downloadLink = document.querySelector('a#receivedFileLink')
+        var ROOM = "chat";//ROOM = prompt('type a room name') -->si pongo esto
+        //entonces se crearán varias salas en donde en cada sala habrám diferentes usuarios.
+        var SIGNAL_ROOM = "signal_room"
+        var FILES_ROOM = "files"
+        var configuration = {//creando los parametros de configuracion para los ICE servers
+            'iceServers':[{
+                'url':'stun:stun.l.google.com:19302' //public stun server que google tiene
+                //disponible para webrtc testing, NOT FOR PRODUCTION.
+                //When you go on production you should change this or either STUN server that  you
+                //setup and mantain OR to a comercial provider and pay for that.
+            }]
+        };
+        var rtcPeerConn;//variable that will be used a lot for events been triggered during the
+        //the signaling processes
+        var dataChannelOptions = {
+            ordered: true//false, //not guaranteed delivery, unreliable but faster
+            //maxRetransmitTime:  1000 //miliseconds
+        }
+
+        var dataChannel;
+        var receivedFileName
+        var receivedFileSize
+        var fileBuffer = []
+        var fileSize = 0
+        // navigator.mediaDevices.enumerateDevices()
+        // .then(devices => getCameras(devices))
+        // videoSelect.onChange = startStream; //chequeando cuando haya cambios en entrada y salida de
+        // //dispositivos
+        // //startStream();
+
+        io = io.connect();
+        io.emit('ready',{"chat_room":ROOM,"signal_room":SIGNAL_ROOM,"files_room":FILES_ROOM});//enciendo el route al que llamé "ready"
+        //lega a anounce to all node incliding who emits ready
+        //also arrives to talk in a way of event to each other (but experimentally it arrives to
+        //all nodes)  
+
+        //send a first signaling message to anyone listening
+        //this normally would be on a button click
+        io.emit('signal',{"type":"user_here","message":"Are you ready for a call?","room":SIGNAL_ROOM})
+        //emito un signaling message hacia el chatroom llamado SIGNAL_ROOM, el cual sera usado
+        //solo para realizar el proceso de sgnaling; se envia a "signaling_message" to each other.
+
+
+        //ahora escuchando el mensaje que venga desde el route signal con el nombre de 
+        //"signaling_message", este le llegara a cualquier otro menos al que lo emite,
+        //el primero que inicia el signal tendra que esperar que haya alguien en la sala para entrar
+        //a este signaling message
+        //--------------00----E---------------
+        io.on('signaling_message',function(data){//cuando inicio la comunicacion
+            //no me llega si yo emití en "signal" ya es un req y no un app.
+            displaySignalMessage("signal received: " + data.type);//muestro lo que me llega de otro nodo
+
+            //setup the rtc peer connection object:
+            if(!rtcPeerConn){//if the object has not been initialized yet...
+                console.log('entro a definir el rtcPeerConn!!')
+                startSignaling();
+
+            }
+            if(data.type!="user_here"){
+                var message = JSON.parse(data.message);
+                if(message.sdp){
+                    rtcPeerConn.setRemoteDescription(new RTCSessionDescription(message.sdp),
+                    function(){
+                        //if we received an offer, we need to answer
+                        if(rtcPeerConn.remoteDescription.type == 'offer'){
+                            rtcPeerConn.createAnswer(sendLocalDesc,logError);
+                        }
+                    },logError
+                    );
+                }else{
+                    rtcPeerConn.addIceCandidate(new RTCIceCandidate(message.candidate));
+                }
+            }
+        })
+
+        io.on('files',function(data){
+            receivedFileName = data.filename
+            receivedFileSize =data.filesize
+            displaySignalMessage("Websockets says the file is on  it's way is " + receivedFileName + 
+            "(" + receivedFileSize + ")" );
+        })
+
+        function startSignaling(){
+            displaySignalMessage("starting signaling...")
+            //inicializando la RTCpeerconnection con nuestros parametros de configuracion
+            rtcPeerConn = new webkitRTCPeerConnection(configuration,null) //añadiendo null
+            //al constructor en vez de otros parametros de conexion, se añadio el null al setear
+            //el datachannel.
+            dataChannel = rtcPeerConn.createDataChannel('textMessages',dataChannelOptions)
+            //seteando el canal de datos con el nombre generico "texMessages", asmimsmo se le pasan
+            //las opciones del datachannel
+            
+            dataChannel.onopen = dataChannelStateChanged;            
+            rtcPeerConn.ondatachannel = receiveDataChannel;
+            //metodos para cuando el canal de datos es abierto y cuando se recibe una conexion 
+            //de un canal de datos de algun peer; es tabmien usual crear un event hanndler
+            //para cuando el data channel es cerrado y se necesita realizar alguna limpieza de 
+            //datos en nuetra UI.
+
+            console.log('Mostrando el objeto rtcPeerConn recien creado: ',rtcPeerConn)
+            //displayMessage("rtcPeerConn object created: ",rtcPeerConn)
+
+            //setting some event handlers
+            //--------------C-------------------
+            //1. Event to receive a new remote candidate (ICE(Interactive connectivity establishment)
+            // candidate via Webrtc)
+            rtcPeerConn.onicecandidate = function(evt) {
+                if(evt.candidate){
+                    console.log("received ICE candidate: ",evt.candidate);
+                    io.emit('signal',{
+                        "type":"ice candidate",//"type":"ice_candidate"==========================
+                        "message":JSON.stringify({'candidate':evt.candidate}),
+                        "room":SIGNAL_ROOM})
+                }
+                
+                displaySignalMessage("completed that ice candidate...");                
+            }
+
+            //--------------B--------D-----------
+            //2.Este event handler sera llamado para crear un SDP offer
+            //y enviarlo a los demas nodos
+            rtcPeerConn.onnegotiationneeded = function(){
+                displaySignalMessage("on negociation called");
+                //retornando una offer al peer que inicia la llamada
+                //dicha offer sera creada con el metodo local sendLocalDescrition
+                rtcPeerConn.createOffer(sendLocalDesc ,  logError);
+            }
+
+            //3. once remote stream arrives, show it in the remote video element
+            rtcPeerConn.onaddstream = function(evt){
+                displaySignalMessage("Going to add their stream...")
+                theirVideoArea.srcObject = evt.stream;
+            }
+            //--------------A-------------------
+            //4.Finally, definiendo mi propio media stream,
+            //mostrarlo en miVideoTag y añadirlo para ser enviado.
+            //tratando de escoger uno que funcione   
+            navigator.getUserMedia = navigator.getUserMedia || 
+            navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+            //var videoSource = videoSelect.value; //-----no se utilizó
+            //seleccionnando la camara elegida el en selector por el user
+            var constraints =  {
+                    audio:false,           
+                    video : {
+                        mandatory:{
+                            minWidth:320,
+                            maxWidth:320,
+                            minHeight:180,
+                            maxHeight:180
+                        }
+                    }
+                };//setting the values
+            navigator.mediaDevices.getUserMedia(constraints)
+            .then(function(stream){
+                onSuccess(stream);
+            })
+            .catch(function (err) {
+                console.log('error with getUserMedia, ', err.name + ": " + err.message);
+                logError(err)
+            });
+        }
+
+        function dataChannelStateChanged(){
+            if(dataChannel.readyState === 'open'){//si el readyState es abierto
+                displaySignalMessage("Data Channel Open")
+                dataChannel.onmessage = receiveDataChannelMessage;//me voy a este 
+                //event handler para setear que hacer cuando se recible un nuevo mensaje.
+            }
+        }
+
+        //Este metodo es para cuando nuestro peer  inicia el data channel hacia nosotros
+        function receiveDataChannel(event){
+            displaySignalMessage("Receiving a data channel")
+            dataChannel = event.channel;//seteando el canal de datos a ser el que el 
+            //canal que es el que ha sido enviado por nuestro peer.
+            dataChannel.onmessage = receiveDataChannelMessage;//el evento de onmessage que esta
+            //almacenado en data channel es manejado por el metodo receiveDataChannelMessage
+        }
+
+        function receiveDataChannelMessage(event){
+            displaySignalMessage("Incoming Message")
+            displayMessage("From data channel: " + event.data);
+
+            //this is where we process incoming files
+            fileBuffer.push(event.data) //pushing each chunk of the incoming file
+            //into fileBuffer
+            fileSize += event.data.byteLength //updating the size of the file
+            fileProgress.value = fileSize //putting the same coount onto the progress bar   
+
+            //provide link to downloadable file when complete
+            if(fileSize === receivedFileSize){
+                var received = new window.Blob(fileBuffer)
+                fileBuffer = []
+
+                downloadLink.href = URL.createObjectURL(received)//finally when all is received
+                //the peer will get the link to download de file
+                downloadLink.download = receivedFileName
+                downloadLink.appendChild(document.createTextNode(receivedFileName + "(" + 
+                fileSize + ") bytes" ))
+            }
+        }
+
+        //onsuccess
+        function onSuccess (stream) {
+            console.log("my stream de llegada a onSuccess: ",stream)
+            //console.log("Success, we have a stream");
+            displaySignalMessage("going to display my stream...")
+            //videoArea.src =  window.URL.createObjectURL(stream);
+            myVideoArea.srcObject = stream;
+            //videoArea.className = "grayscale_filter"
+            //videoArea.play();
+            rtcPeerConn.addStream(stream); //añadiendo mi stream en el rtcPeerConn
+            console.log("rtcPeerConn with my stream: ",rtcPeerConn) //-->OK
+        }
+        //sendLocalDesc ==> send local DESCRIPTION
+        function sendLocalDesc(desc){
+            console.log("Local description offer/answer created in CreateOffer/createAnswer that enters into sendLocalDesc function",
+            desc);//------------>aqui hay un error entra varias veces, cuando solo ha entrado un usuario mas.
+            rtcPeerConn.setLocalDescription(desc , function(){
+                displaySignalMessage("Sending Local description");
+                var sdp = {//creando mi session description protocol (SDP) 
+                    //del nodo en el que me encuentro: Esta informacion es acerca
+                    //del video codec, resolution,etc
+                    "type":"SDP",
+                    "message":JSON.stringify({'sdp':rtcPeerConn.localDescription}),
+                    "room":SIGNAL_ROOM
+                }
+                console.log("sdp sent to other nodes in sendLocalDescription: ",sdp)
+                io.emit('signal',sdp);           
+            },logError);
+        }
+
+        function logError(error){
+            displaySignalMessage(error.name + ': ' + error.message );
+        }
+
+        io.on('talk', function(data) {//dentro de ready llamo a talk
+            alert(data.message)
+        })
+        io.on('announce', function(data){//llamando a talk
+            displayMessage(data.message) //le decimos a socket.io que llame el metodo displayMessage
+            //siempre que algun mensaje de tipo announce es recibido
+        })
+
+        io.on('message',function(data){
+            displayMessage(data.author + " > " + data.message);
+        })//me mantengo escuchando si desde este route me llega algo
+
+        sendMessage.addEventListener('click',function(ev){
+            io.emit('send',{"author":myName.value,"message":myMessage.value,"room":ROOM})
+            //dataChannel.send(myName.value + " says " + myMessage.value );
+            ev.preventDedault();
+        },false);//cuando un usuario emite un mensaje, entonces este hace un broadcast al ROOM,
+        //a cada ROOM le llegara el nombre de quien lo envia y tambien el mensaje, este route 
+        //es llevado gracias a la logica implementada en server.js en su route llamado send
+        
+        sendFile.addEventListener('change',function(ev){
+            var file = sendFile.files[0];
+            displaySignalMessage("sending file " + file.name + "(" + file.size + "...)"  )
+            io.emit('files',{"filename":file.name,"filesize":file.size,"room":FILES_ROOM})
+            
+            fileProgress.max = file.size
+            var chunkSize = 16384//kilobytes
+            var sliceFile = function(offset){
+                var reader  = new window.FileReader()//using filereader library to slice the file
+                //into 16384 file chunks
+                reader.onload = (function(){
+                    return function(e){
+                        dataChannel.send(e.target.result)//sending each chunk individually over the webrtc
+                        //channel
+                        if  (file.size > offset + e.target.result.byteLength){
+                            window.setTimeout(sliceFile,0,offset + chunkSize)
+                        }
+                        fileProgress.value = offset + e.target.result.byteLength                    
+                    }//updating the fileProgress bar with the number of bytes sent up to this point.
+                })(file)
+                var slice = file.slice(offset , offset + chunkSize)
+                reader.readAsArrayBuffer(slice);
+            }
+            sliceFile(0)
+
+
+        },false);
+
+
+        function displayMessage(message){
+            chatArea.innerHTML = chatArea.innerHTML + "<br/>" + message; //solo se adjunta el mensaje
+        }       
+        function displaySignalMessage(message){
+            signalingArea.innerHTML = signalingArea.innerHTML + "<br/>" + message; //solo se adjunta el mensaje
+        }
+    </script>
+</body>
+</html>
